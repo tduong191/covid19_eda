@@ -1,0 +1,228 @@
+---
+title: "data_wrangling"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Packages
+```{r,  eval=FALSE, echo=FALSE, warning=FALSE}
+library(dplyr)
+library(readxl)
+library(tidyverse)
+library(stringr)
+library(gdata)
+library(funModeling) 
+library(Hmisc)
+library(magrittr)
+#library(xlsx)
+# install.packages("gdata")
+# install.packages("xlsx")
+# install.packages("funModeling")
+# install.packages("Hmisc")
+```
+
+Import Data 
+```{r, eval=FALSE, echo=FALSE, warning=FALSE}
+#read raw linelisting data
+data <- readxl::read_excel("~/Dropbox/raw data/Pha_n ti_ch ca du_o_ng ti_nh COVID-19-3.xlsx")
+
+dict <- readxl::read_excel("~/Dropbox/clean data/dictionary_covid.xlsx")
+```
+
+
+Translate the columns' name
+```{r}
+dict <- dict %>% 
+  mutate(`Variable name (Viet)` = stringr::str_replace_all(`Variable name (Viet)`,"\n", "")) #clean columns
+colnames(data) <- stringr::str_replace_all(colnames(data), "\r\n", "") #clean columns
+colnames(data) <- dict$`Variable after fixed and translated`
+```
+
+Remove unnecessary columns (note "remove" in dictionary_covid.xlsx)
+```{r}
+remov <- dict$`Variable after fixed and translated`[dict$Note == "remove"] 
+remove <- remov[which(remov != "NA")]
+data <- data %>%
+  select(-c(remove,age))
+# remove NA rows (2571th onwards)
+data <- data[1:2570,] 
+```
+
+Remove Vietnamese tone
+```{r}
+data %<>% 
+  apply(2, function(x)stringi::stri_trans_general(x, 'any-ascii')) %>% 
+  as.data.frame()
+  
+```
+
+Explore Data
+```{r}
+basic_eda <- function(data)
+{
+  glimpse(data)
+  print(status(data))
+  freq(data) 
+  print(profiling_num(data))
+  plot_num(data)
+  describe(data)
+}
+
+basic_eda(data)
+```
+
+Clean data 
+```{r}
+###### birthYear column
+data$birthYear[which(grepl("55",data$birthYear))] <- 1966
+###### recode gender
+data <- data %>% 
+  mutate(gender= recode(gender,
+                         "Nam" = "male",
+                         "Nu"  = "female"))
+###### recode isImport
+data <- data %>% mutate(isImport = ifelse(is.na(isImport), FALSE, # 22 cases with isImport = NA are from Hai Duong
+                                          ifelse(isImport == "O dich nuoc ngoai", TRUE, FALSE)))
+###### add city_infected column (take city names from country_infected column)
+data %<>% 
+  mutate(city_infected = ifelse(country_infected %in% c('Bac Ninh', 'Binh Duong', 'Da Nang', 'Dak Lak','Dong Nai', 'Gia Lai', 'Ha Nam', 'Ha Noi',
+                                                        'Hai Duong', 'Hai Phong', 'Ho Chi Minh', 'Quang Nam', 'Quang Ngai', 'Quang Ninh',
+                                                        'TP Ho Chi Minh', 'Vinh Phuc', 'London'), .$country_infected, NA)) %>%
+  mutate(city_infected = recode(city_infected, "TP Ho Chi Minh" = "Ho Chi Minh"))
+  
+###### recode country_infected column: if the info in the column is city then it is moved to city_infected column
+## NOTE: NB097, 098 belong to buddha bar cluster but have country_infected as Malaysia (they flew from Malaysia the day before buddha bar)
+data %<>%  
+  mutate(country_infected = case_when(is.na(country_infected) & !isImport ~ 'Vietnam',    
+                                      is.na(country_infected) & isImport  ~ NA_character_,
+                                      !is.na(country_infected) & !is.na(city_infected) ~ 'Vietnam',
+                                      TRUE ~ country_infected))
+data$country_infected[data$city_infected == 'London'] <- 'UK'
+  
+###### add potential contactID_infected_potential : potential infectors from location_infected column
+## NOTE: compare it with contactID_infected
+data %<>%
+  mutate(contactID_infected_potential = ifelse(grepl("BN",location_infected), location_infected, NA)) %>% 
+  mutate(location_infected = ifelse(grepl("BN",location_infected), NA, location_infected))
+###### recode location_infected
+city_loc_infected <- c("Amsterdam", "Bangkok", "Barcelona", "Budapest", "Copenhagen", "Copenhangen", "Da Nang", "Deagu",  "Dubai", "Guam",   "Istabul", "Kuala", "Kuala Lumpur", "London", "Mat-xco-va", "Michigan", "Moscow", "New York", "Paris", "Praha", "Tokyo", "Vu Han", "Washington", "Zurich")
+country_loc_infected <- c("Anh", "Campuchia", "Dai Loan", "Nga", "Phap")
+# add cities from location_infected to city_infected where city_infected is missing
+data %<>% 
+  mutate(city_infected = ifelse(location_infected %in% city_loc_infected, location_infected, city_infected)) %>% 
+  mutate(location_infected = ifelse(location_infected %in% city_loc_infected, NA, location_infected))
+# remove countries from location_infected
+data %<>%
+  mutate(location_infected = ifelse(location_infected %in% country_loc_infected, NA, location_infected))
+
+contactID <- data$contactID_infected
+ID_pos_contactID <- grep("\\d{1,}", contactID)
+ID_contactID <- contactID[ID_pos_contactID]
+cluster_contactID <- contactID[-ID_pos_contactID]
+data %<>% 
+  mutate(contactID_infected = ifelse(contactID_infected %in% c("Chua xac dinh", "Cong dong", "Da Nang", "Du lich Da Nang", "BV Da Nang", "Benh vien Da Nang", "Khong ro"),
+                                                             NA, contactID_infected)) 
+###### add flightseatInfo column
+seats  <- sapply(data$flightInfo, function(x) str_extract_all(x, "(?<=\\().+?(?=\\))"))
+data$flightseatInfo <- as.vector(sapply(seats, function(x) paste(x, collapse = ",", recycle0 = TRUE)))
+data$flightseatInfo[data$flightseatInfo %in% c("","NA")] <- NA
+data$flightseatInfo <- gsub("[a-zA-Z]{2,}","", data$flightseatInfo)
+data$flightseatInfo <- gsub("\\/","\\,",data$flightseatInfo)
+data$flightseatInfo <- trim(data$flightseatInfo)
+data$flightseatInfo <- gsub("\\,$","",data$flightseatInfo)
+###### recode flightInfo
+## NOTE: remove some of flightInfo cells about illegal border crossing 
+data$flightInfo <- gsub("\\(.+?\\)","",data$flightInfo)
+data$flightInfo <- gsub("\\/", "\\,", data$flightInfo)
+data$flightInfo <- gsub("\\s+","", data$flightInfo)
+```
+
+
+
+```{r translate columns}
+# translate city_infected
+data %<>% 
+  mutate(city_infected = recode(city_infected, 
+                                "Copenhangen" = "Copenhagen"  , "Istabul"    = "Istanbul", "Vu Han" = "Wuhan",
+                                "Kuala"       = "Kuala Lumpur", "Mat-xco-va" = "Moscow"  , "Praha"  = "Prague"))
+# translate country_infected
+data %<>% 
+  mutate(country_infected = recode(country_infected, 
+                                   "Trung Quoc"     = "China"       , "Anh"                   = "UK" ,
+                                   "Han Quoc"       = "Korea"       , "My"                    = "US",
+                                   "Phap"           = "France"      , "Sec"                   = "Czech" ,
+                                   "Tay Ban Nha"    = "Spain"       , "Thuy Si"               = "Switzerland",
+                                   "Ha Lan"         = "Netherlands" , "Nga"                   = "Russia",  
+                                   "Tho Nhi Ky"     = "Turkey"      , "Campuchia"             = "Cambodia" ,           
+                                   "Thai Lan"       = "Thailand"    , "Dan Mach"              = "Denmark",       
+                                   "Duc"            = "Germany"     , "Uc"                    = "Australia",   
+                                   "Hy Lap"         = "Greece"      , "CH Sec"                = "Czech",  
+                                   "Nhat Ban"       = "Japan"       , "Hoa Ky"                = "US",     
+                                   "NIgeria"        = "Nigeria"     , "Sebria"                = "Serbia",      
+                                   "Philipines"     = "Philippines" , "Guinea Xich dao"       = "Equatorial Guinea", 
+                                   "A Rap - Xe Ut"  = "Saudi Arabia", "Guinea Xich Dao"       = "Equatorial Guinea",
+                                   "Dai Loan"       = "Taiwan"      , "Ukraina"               = "Ukraine",  
+                                   "An Do"          = "India"       , "Vuong quoc Arab Saudi" = "Saudi Arabia",     
+                                   "Cong hoa Czech" = "Czech"       , "Nam Phi"               = "South Africa",
+                                   "Ba Lan"         = "Poland"      , "Cong hoa Sec"          = "Czech",
+                                   "Ao"             = "Austria"     , "Thuy Dien"             = "Sweden",       
+                                   "Dubai-UAE"      = "Dubai"        , "Phan Lan"             =  "Finland"))
+  
+                 
+
+```
+
+
+
+Get the first positive PCR test
+```{r}
+first_positive <- function(x) {
+  first(which(x == "Duong tinh"))
+}
+PCR1.pos <- data %>% 
+  select(id, starts_with("samplingDate"), starts_with("result")) %>% 
+  rowwise() %>% 
+  mutate(PCR1.pos = ifelse(!is.na(result1),magrittr::extract(c_across(samplingDate1:samplingDate28), first_positive(c_across(result1:result28))), NA)) %>% 
+  mutate(PCR1.pos = as.Date(PCR1.pos, origin = "1970-01-01")) %>% 
+  select(PCR1.pos)
+data %<>% 
+  cbind(PCR1.pos)
+```
+
+
+
+Merge informations on symptomatic status into a new column: is_symp_linelisting
+```{r }
+symp_linelisting <- data %>%
+  select(id, onsetSymp_symptom, hospitalizedSym_symptom, isFever_symptom:isFatigue_symptom, is_symptom)      
+# If any of the following columns is not NA, then Any_symptom_logical is TRUE, otherwise NA: isFever_symptom:isFatigue_symptom
+symp_linelisting$Any_symptom_logical <- symp_linelisting %>%  
+  select(isFever_symptom:isFatigue_symptom) %>% 
+  apply(1, function(x) !all(is.na(x)))
+symp_linelisting$Any_symptom_logical[symp_linelisting$Any_symptom_logical == F] <- NA
+symp_linelisting %<>% 
+  mutate(Onset_symptom_logical = ifelse(onsetSymp_symptom == 'no', FALSE, ifelse(is.na(onsetSymp_symptom), NA, TRUE)))
+                     
+symp_linelisting %<>% 
+  mutate(Hospitalized_symptom_logical = ifelse(hospitalizedSym_symptom == "no", 
+  FALSE, ifelse(is.na(hospitalizedSym_symptom), NA, TRUE)))
+symp_linelisting %<>% 
+  mutate(is_symp_linelisting = pmax(Any_symptom_logical, Onset_symptom_logical, Hospitalized_symptom_logical, is_symptom, na.rm = T) %>% 
+  ifelse(is.infinite(.), NA, .))
+symp_linelisting %<>%
+  mutate(is_symp_linelisting = as.logical(is_symp_linelisting))
+symp_linelisting %<>%
+  select(id, is_symp_linelisting)
+data <- left_join(data, symp_linelisting, by='id')
+```
+
+
+
+
+Save RDS
+```{r}
+saveRDS(data,"~/Dropbox/clean data/fdata_March21.rds")
+```
